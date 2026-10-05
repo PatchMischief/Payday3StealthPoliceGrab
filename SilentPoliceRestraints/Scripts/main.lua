@@ -38,8 +38,8 @@ local function same(a, b)
 end
 local function bool(value) return value == true or value == 1 end
 local function name(object)
-    local ok, result = call(object, "GetName")
-    if ok and type(result) == "string" then return result end
+    local ok, result = call(object, "GetFName")
+    if not ok then return nil end
     local text_ok, text = pcall(function() return result:ToString() end)
     if text_ok then return text end
 end
