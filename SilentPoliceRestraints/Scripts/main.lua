@@ -1,12 +1,14 @@
--- SilentPoliceRestraints 0.1.0. Native gameplay is experimental until heist-tested.
+-- SilentPoliceRestraints 0.1.1. Native gameplay is experimental until heist-tested.
 -- F6: request a rear grab; while holding an admitted officer, request release/tie.
 local rules = require("rules")
 local PREFIX = "[SilentPoliceRestraints] "
+local VERSION = "0.1.1"
 local START_HOOK = "/Script/Starbreeze.SBZInteractorComponent:Server_StartInteraction"
 local records, requests, hook_frames, silenced = {}, {}, {}, {}
 local hooks_ready, queued, key_queued, diagnostics_queued = false, false, false, false
 local sequence = 0
-local GRAB_TIMEOUT, ACTION_TIMEOUT, HOLD_TIMEOUT = 6, 8, 300
+local GRAB_TIMEOUT, ACTION_TIMEOUT, HOLD_TIMEOUT, RELEASE_GRACE = 6, 8, 300, 0.35
+local MODE_NAMES = {[1] = "HumanShield", [3] = "OrderDownOnGround", [4] = "TieHands"}
 
 local function log(message) print(PREFIX .. tostring(message) .. "\n") end
 local function valid(object)
@@ -101,7 +103,7 @@ end
 local function mode_index(component, mode)
     for index, value in ipairs(array_values(read(component, "ModeArray"))) do
         value = enum_value(value)
-        if value == mode or (mode == 1 and value == "HumanShield") then
+        if value == mode or value == MODE_NAMES[mode] then
             return index - 1 -- UE4SS TArray indices are one-based; the native RPC is zero-based.
         end
     end
@@ -206,7 +208,32 @@ local function confirm_capture(record)
     record.captured = true
     silenced[record.key] = {actor = record.actor, world = record.world}
 end
+local function describe(record)
+    local actor, pawn = record.actor, record.pawn
+    local modes = {}
+    for _, value in ipairs(array_values(read(read(actor, "Interactable"), "ModeArray"))) do
+        modes[#modes + 1] = tostring(enum_value(value))
+    end
+    return "phase=" .. tostring(record.phase) .. "; hostage=" .. tostring(read(actor, "HostageState"))
+        .. "; surrendered=" .. tostring(read(actor, "bIsSurrendered"))
+        .. "; carried=" .. tostring(read(actor, "bIsCarried"))
+        .. "; exit=" .. tostring(read(pawn, "HumanShieldInstigatorState"))
+        .. "; down=" .. tostring(read(actor, "bIsInDownOnGroundPose"))
+        .. "; radio_removed=" .. tostring(read(actor, "bIsPagerSnatched"))
+        .. "; pager=" .. tostring(read(actor, "bIsPagerEnabled"))
+        .. "; pending_pager=" .. tostring(read(actor, "bIsPendingPagerEnabled"))
+        .. "; modes=" .. table.concat(modes, ",")
+end
 local function finish(record, message)
+    local request_key = address(record.pawn)
+    local request = requests[request_key]
+    if request and same(request.actor, record.actor) then
+        local ok, current = call(request.interactor, "GetCurrentInteraction")
+        if ok and same(current, request.component) then
+            call(request.interactor, "Server_StopInteraction", request.component)
+        end
+        requests[request_key] = nil
+    end
     if not restore(record) then
         record.restore_attempts = (record.restore_attempts or 0) + 1
         record.restore_message = message or record.restore_message
@@ -233,7 +260,11 @@ local function admit(actor, pawn, controller)
     if original.valid == nil or original.allowed == nil or original.down == nil or original.snatched == nil then
         log("Officer permission or radio state is unavailable; capture cancelled."); return nil
     end
-    if bool(read(actor, "bIsPagerEnabled")) or bool(read(actor, "bIsPendingPagerEnabled")) then
+    local pager_enabled, pager_pending = read(actor, "bIsPagerEnabled"), read(actor, "bIsPendingPagerEnabled")
+    if pager_enabled == nil or pager_pending == nil then
+        log("Officer pager activity is unavailable; capture cancelled."); return nil
+    end
+    if bool(pager_enabled) or bool(pager_pending) then
         log("Officer already has an active or pending pager; capture cancelled."); return nil
     end
     original.valid, original.allowed, original.down = bool(original.valid), bool(original.allowed), bool(original.down)
@@ -262,7 +293,16 @@ end
 local function hook_pre(context, interaction_param, _, mode_param)
     local interactor, interaction = unbox(context), unbox(interaction_param)
     local ok, pawn = call(interactor, "GetOwner")
-    if not ok or not authority(pawn) then return end
+    if not ok then return end
+    local request_key = address(pawn)
+    if request_key and requests[request_key] then
+        -- Requests are stored after Start returns. Any later Start, including
+        -- a new mode on the same officer, supersedes that pending completion.
+        -- Its component may be identical, so component equality is insufficient.
+        requests[request_key] = nil
+        log("A newer native interaction superseded the pending mod interaction.")
+    end
+    if not authority(pawn) then return end
     local index = unbox(mode_param)
     if type(index) ~= "number" then return end
     local mode = raw_mode(interaction, index)
@@ -290,11 +330,42 @@ local function install_hooks()
     local ok = pcall(RegisterHook, START_HOOK, hook_pre, hook_post)
     if ok then hooks_ready = true else log("Interaction hook unavailable; F6 is disabled.") end
 end
-local function push_action(record, path)
-    local cls = find(path)
-    if not valid(cls) then return false end
-    local ok, action = call(read(record.actor, "Controller"), "PushAction", cls, record.pawn)
-    return ok and valid(action)
+local function begin_restraint_interaction(record, mode)
+    local pawn, actor = record.pawn, record.actor
+    local interactor, component = read(pawn, "Interactor"), read(actor, "Interactable")
+    if not authority(pawn) or not authority(actor) then return false, "Host authority lost" end
+    local key = address(pawn)
+    if key == nil or not valid(interactor) or not valid(component) then
+        return false, "Native interactor or officer component unavailable"
+    end
+    if requests[key] then return nil end -- Finish the previous mode before starting another.
+    local current_ok, current = call(interactor, "GetCurrentInteraction")
+    if not current_ok then return false, "Current interaction unavailable: " .. tostring(current) end
+    if valid(current) then return nil end
+    local index = mode_index(component, mode)
+    if index == nil then return false, "Officer has no native " .. MODE_NAMES[mode] .. " mode" end
+    local id = read(interactor, "InteractId")
+    if type(id) ~= "number" then return false, "Native interaction id unavailable" end
+    sequence = (sequence + 1) % 1000000
+    id = id + sequence
+    local ok, message = call(interactor, "Server_StartInteraction", component, id, index)
+    if not ok then return false, "Native " .. MODE_NAMES[mode] .. " call failed: " .. tostring(message) end
+    -- Start can finish a zero-duration action immediately; its void return
+    -- and a null CurrentInteraction do not establish gameplay failure.
+    local duration = read(component, "Duration")
+    if type(duration) ~= "number" or duration ~= duration or duration < 0 or duration > ACTION_TIMEOUT then
+        local active_ok, active = call(interactor, "GetCurrentInteraction")
+        if active_ok and same(active, component) then call(interactor, "Server_StopInteraction", component) end
+        return false, "Native " .. MODE_NAMES[mode] .. " duration unavailable"
+    end
+    requests[key] = {
+        pawn = pawn, actor = actor, world = record.world, component = component,
+        interactor = interactor, id = id, mode = mode, record = record,
+        complete_at = now(pawn) + duration + 0.1,
+    }
+    record.deadline = requests[key].complete_at + ACTION_TIMEOUT
+    log("Requested native " .. MODE_NAMES[mode] .. "; duration=" .. tostring(duration) .. ".")
+    return true
 end
 local function tick()
     install_hooks()
@@ -313,8 +384,17 @@ local function tick()
             or not same(world(request.pawn), request.world) or not same(world(request.actor), request.world) then
             requests[key] = nil
         elseif now(request.pawn) >= request.complete_at then
-            if not held_by(request.actor, request.pawn) then
-                call(request.interactor, "Server_CompleteInteraction", request.component, request.id)
+            local current_ok, current = call(request.interactor, "GetCurrentInteraction")
+            -- Do not complete an aborted request or the player's new interaction.
+            local client_grab = request.mode == nil and not authority(request.pawn) and not valid(current)
+            if current_ok and (same(current, request.component) or client_grab)
+                and not (request.mode == nil and held_by(request.actor, request.pawn)) then
+                local ok, message = call(request.interactor, "Server_CompleteInteraction", request.component, request.id)
+                if not ok then
+                    local failure = "Native interaction completion failed: " .. tostring(message)
+                    if request.record then finish(request.record, failure .. "; " .. describe(request.record))
+                    else log(failure) end
+                end
             end
             requests[key] = nil
         end
@@ -331,8 +411,11 @@ local function tick()
             -- Retain the snapshot for diagnostics until the actor is destroyed.
         elseif not alive or not same(world(record.pawn), record.world) or not same(world(record.actor), record.world) then
             finish(record)
+        elseif record.captured and has_state(record.actor, 4) then
+            finish(record, "Officer restrained (native hostage state confirmed); radio remains removed.")
         elseif now(record.pawn) >= record.deadline then
-            finish(record, "Native " .. record.phase .. " timed out; permissions restored.")
+            log("Native transition timed out: " .. describe(record))
+            finish(record, "Native " .. record.phase .. " timed out; temporary permissions restored.")
         elseif record.phase == "grabbing" then
             if held_by(record.actor, record.pawn) then
                 confirm_capture(record)
@@ -341,21 +424,48 @@ local function tick()
             end
         elseif record.phase == "held" then
             if not bool(read(record.actor, "bIsCarried")) and not same(read(record.pawn, "CurrentCarryActor"), record.actor) then
-                if push_action(record, "/Script/Starbreeze.SBZAIAction_GetDownOnGround") then
-                    record.phase, record.deadline = "going down", now(record.pawn) + ACTION_TIMEOUT
-                else finish(record, "The game rejected the get-down action.") end
+                record.phase, record.deadline = "releasing", now(record.pawn) + ACTION_TIMEOUT
+                record.release_at = now(record.pawn) + RELEASE_GRACE
             elseif bool(read(record.actor, "bIsCarried")) and not held_by(record.actor, record.pawn) then
                 finish(record, "Officer transferred; request cancelled.")
             end
+        elseif record.phase == "releasing" then
+            local exit_state = enum_value(read(record.pawn, "HumanShieldInstigatorState"))
+            if not bool(read(record.actor, "bIsCarried"))
+                and not valid(read(record.pawn, "CurrentCarryActor"))
+                and (exit_state == 0 or exit_state == "None") and now(record.pawn) >= record.release_at then
+                if not authority(record.pawn) or not authority(record.actor) then
+                    finish(record, "Host authority lost during release."); goto continue_record
+                end
+                if not record.surrender_requested then
+                    record.surrender_requested = true
+                    local ok, message = call(record.actor, "Multicast_Surrender")
+                    if not ok then
+                        finish(record, "Native surrender call failed: " .. tostring(message) .. "; " .. describe(record))
+                    end
+                end
+                if records[record.key] == record and record.phase == "releasing" then
+                    record.phase, record.deadline = "surrendering", now(record.pawn) + ACTION_TIMEOUT
+                    log("Native surrender requested; waiting for the officer's surrendered state.")
+                end
+            end
+        elseif record.phase == "surrendering" then
+            if has_state(record.actor, 2) or bool(read(record.actor, "bIsInDownOnGroundPose")) then
+                record.phase, record.deadline = "going down", now(record.pawn) + ACTION_TIMEOUT
+            elseif bool(read(record.actor, "bIsSurrendered")) then
+                local ok, message = begin_restraint_interaction(record, 3)
+                if ok then record.phase = "going down"
+                elseif ok == false then finish(record, message .. "; " .. describe(record)) end
+            end
         elseif record.phase == "going down" then
             if has_state(record.actor, 2) or bool(read(record.actor, "bIsInDownOnGroundPose")) then
-                if push_action(record, "/Script/Starbreeze.SBZAIAction_HogTie") then
-                    record.phase, record.deadline = "tying", now(record.pawn) + ACTION_TIMEOUT
-                else finish(record, "The game rejected the restraint action.") end
+                local ok, message = begin_restraint_interaction(record, 4)
+                if ok then
+                    record.phase = "tying"
+                elseif ok == false then finish(record, message .. "; " .. describe(record)) end
             end
-        elseif record.phase == "tying" and has_state(record.actor, 4) then
-            finish(record, "Officer restrained (native hostage state confirmed).")
         end
+        ::continue_record::
     end
 end
 local function shove(pawn)
@@ -382,7 +492,14 @@ local function action()
         if authority(pawn) and not records[address(carried)] then
             log("This officer was not admitted by this mod."); return
         end
-        if shove(pawn) then log("Release requested; waiting for the host's native restraint actions.")
+        local record = records[address(carried)]
+        if authority(pawn) and record and record.phase == "grabbing" then
+            -- Input can arrive between native carry confirmation and our next
+            -- poll. Preserve that confirmed capture before shove clears it.
+            confirm_capture(record)
+            record.phase, record.deadline = "held", now(pawn) + HOLD_TIMEOUT
+        end
+        if shove(pawn) then log("Release requested; waiting for the exit animation, then native get-down/tie interactions.")
         else log("The game rejected release, or its human-shield ability is unavailable.") end
         return
     end
@@ -394,6 +511,15 @@ local function action()
         if valid(actor) and same(world(actor), world(pawn)) then
             local state = snapshot(actor, pawn, controller)
             local eligible, failure = rules.can_grab(state)
+            if eligible then
+                local snatched, enabled, pending = read(actor, "bIsPagerSnatched"),
+                    read(actor, "bIsPagerEnabled"), read(actor, "bIsPendingPagerEnabled")
+                if snatched == nil or enabled == nil or pending == nil then
+                    eligible, failure = false, "Officer radio state is unavailable"
+                elseif bool(enabled) or bool(pending) then
+                    eligible, failure = false, "Officer already has an active or pending pager"
+                end
+            end
             local interaction = read(actor, "Interactable")
             local candidate_index = mode_index(interaction, 1)
             local distance = state.distance_cm or math.huge
@@ -430,10 +556,10 @@ local function diagnostics()
     for _ in pairs(records) do count = count + 1 end
     local silent_count = 0
     for _ in pairs(silenced) do silent_count = silent_count + 1 end
-    log("0.1.0; hook=" .. tostring(hooks_ready) .. "; player=" .. tostring(valid(pawn))
+    log(VERSION .. "; hook=" .. tostring(hooks_ready) .. "; player=" .. tostring(valid(pawn))
         .. "; authority=" .. tostring(authority(pawn)) .. "; managed=" .. tostring(count)
         .. "; radios_removed=" .. tostring(silent_count))
-    for _, record in pairs(records) do log((name(record.actor) or "officer") .. ": " .. record.phase) end
+    for _, record in pairs(records) do log((name(record.actor) or "officer") .. ": " .. describe(record)) end
 end
 local function queue(callback, done)
     ExecuteInGameThread(function()
@@ -459,7 +585,7 @@ LoopAsync(100, function()
     end
     return false
 end)
-log("Loaded experimental 0.1.0. F6 grabs/releases an officer; F8 reports native state.")
+log("Loaded experimental " .. VERSION .. ". F6 grabs/releases an officer and removes its radio; F8 reports native state.")
 
 -- Returning entry points lets the adapter be exercised without a game process.
 return {request_action = action, tick = tick, diagnostics = diagnostics, managed = records}
