@@ -331,7 +331,7 @@ local function action()
         return
     end
     if requests[address(pawn)] then log("A grab request is already pending."); return end
-    local target, component, index, nearest = nil, nil, nil, math.huge
+    local target, component, index, nearest, nearest_failure = nil, nil, nil, math.huge, math.huge
     local reason = "No eligible unnoticed officer nearby."
     for _, cop_controller in pairs(objects("BP_CopController_C")) do
         local actor = read(cop_controller, "Pawn")
@@ -341,12 +341,11 @@ local function action()
             local interaction = read(actor, "Interactable")
             local candidate_index = mode_index(interaction, 1)
             local distance = state.distance_cm or math.huge
-            if distance < nearest then
-                nearest, reason = distance, failure
-                target, component, index = nil, nil, nil
-                if eligible and candidate_index ~= nil then
-                    target, component, index = actor, interaction, candidate_index
-                elseif eligible then reason = "The game has no human-shield mode on this officer." end
+            if eligible and candidate_index ~= nil and distance < nearest then
+                nearest, target, component, index = distance, actor, interaction, candidate_index
+            elseif distance < nearest_failure then
+                nearest_failure = distance
+                reason = eligible and "The game has no human-shield mode on this officer." or failure
             end
         end
     end
