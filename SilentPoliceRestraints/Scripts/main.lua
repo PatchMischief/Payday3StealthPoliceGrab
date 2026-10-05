@@ -1,8 +1,8 @@
--- SilentPoliceRestraints 0.1.1. Native gameplay is experimental until heist-tested.
+-- SilentPoliceRestraints 0.1.2. Native gameplay is experimental until heist-tested.
 -- F6: request a rear grab; while holding an admitted officer, request release/tie.
 local rules = require("rules")
 local PREFIX = "[SilentPoliceRestraints] "
-local VERSION = "0.1.1"
+local VERSION = "0.1.2"
 local START_HOOK = "/Script/Starbreeze.SBZInteractorComponent:Server_StartInteraction"
 local records, requests, hook_frames, silenced = {}, {}, {}, {}
 local hooks_ready, queued, key_queued, diagnostics_queued = false, false, false, false
@@ -53,6 +53,11 @@ local function array_values(array)
     if type(array) == "table" then return array end
     local result = {}
     if array ~= nil then
+        -- Missing reflected properties can be null UObject userdata in UE4SS.
+        -- Only TArray supports ForEach; pcall cannot make a null native call
+        -- safe when the loader itself crashes while formatting that error.
+        local ok, wrapper_type = pcall(function() return array:type() end)
+        if not ok or wrapper_type ~= "TArray" then return result end
         pcall(function()
             array:ForEach(function(index, value) result[index] = unbox(value) end)
         end)
@@ -101,6 +106,7 @@ local function enum_value(value)
     if type(value) == "string" then return value:match("([^:]+)$") end
 end
 local function mode_index(component, mode)
+    if not valid(component) then return nil end
     for index, value in ipairs(array_values(read(component, "ModeArray"))) do
         value = enum_value(value)
         if value == mode or value == MODE_NAMES[mode] then
@@ -109,6 +115,7 @@ local function mode_index(component, mode)
     end
 end
 local function raw_mode(component, index)
+    if not valid(component) then return nil end
     return enum_value(array_values(read(component, "ModeArray"))[index + 1])
 end
 local function held_by(actor, pawn)
