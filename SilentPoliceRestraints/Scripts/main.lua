@@ -191,7 +191,7 @@ local function restore(record)
 end
 local function finish(record, message)
     restore(record)
-    records[address(record.actor)] = nil
+    records[record.key] = nil
     if message then log(message) end
 end
 local function admit(actor, pawn, controller)
@@ -210,7 +210,7 @@ local function admit(actor, pawn, controller)
     if not valid(shield_data) then shield_data = read(actor, "SurrenderedHumanShieldData") end
     if not valid(shield_data) then return nil end
     local record = {
-        actor = actor, pawn = pawn, world = world(pawn), original = original,
+        key = key, actor = actor, pawn = pawn, world = world(pawn), original = original,
         phase = "grabbing", deadline = now(pawn) + GRAB_TIMEOUT,
     }
     records[key] = record
