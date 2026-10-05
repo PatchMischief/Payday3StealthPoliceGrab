@@ -278,7 +278,10 @@ end
 local function tick()
     install_hooks()
     for key, request in pairs(requests) do
-        if not valid(request.pawn) or not same(world(request.pawn), request.world) then
+        if not valid(request.pawn) or not valid(request.actor)
+            or not valid(request.interactor) or not valid(request.component)
+            or not bool(read(request.pawn, "bIsAlive")) or not bool(read(request.actor, "bIsAlive"))
+            or not same(world(request.pawn), request.world) or not same(world(request.actor), request.world) then
             requests[key] = nil
         elseif now(request.pawn) >= request.complete_at then
             if not held_by(request.actor, request.pawn) then
