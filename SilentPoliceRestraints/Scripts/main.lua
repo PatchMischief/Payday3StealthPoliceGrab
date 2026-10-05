@@ -3,7 +3,7 @@
 local rules = require("rules")
 local PREFIX = "[SilentPoliceRestraints] "
 local START_HOOK = "/Script/Starbreeze.SBZInteractorComponent:Server_StartInteraction"
-local records, requests, hook_frames = {}, {}, {}
+local records, requests, hook_frames, silenced = {}, {}, {}, {}
 local hooks_ready, queued, key_queued, diagnostics_queued = false, false, false, false
 local sequence = 0
 local GRAB_TIMEOUT, ACTION_TIMEOUT, HOLD_TIMEOUT = 6, 8, 300
@@ -188,6 +188,11 @@ local function restore(record)
         function() record.actor.HumanShieldData = record.original.data end,
         function() record.actor:SetHumanShieldAllowed(record.original.allowed) end,
         function() record.actor:SetDownOnGroundAllowed(record.original.down) end,
+        function()
+            -- Removing the radio is part of a confirmed capture. A later
+            -- restraint failure must not give that officer a fresh pager.
+            record.actor.bIsPagerSnatched = record.captured or record.original.snatched
+        end,
     }) do
         local ok, error_message = pcall(setter)
         if not ok then
@@ -196,6 +201,10 @@ local function restore(record)
         end
     end
     return restored
+end
+local function confirm_capture(record)
+    record.captured = true
+    silenced[record.key] = {actor = record.actor, world = record.world}
 end
 local function finish(record, message)
     if not restore(record) then
@@ -219,9 +228,16 @@ local function admit(actor, pawn, controller)
     local original = {
         valid = read(actor, "bIsValidHumanShield"), data = read(actor, "HumanShieldData"),
         allowed = read(actor, "bIsHumanShieldAllowed"), down = read(actor, "bIsDownOnGroundAllowed"),
+        snatched = read(actor, "bIsPagerSnatched"),
     }
-    if original.valid == nil or original.allowed == nil or original.down == nil then return nil end
+    if original.valid == nil or original.allowed == nil or original.down == nil or original.snatched == nil then
+        log("Officer permission or radio state is unavailable; capture cancelled."); return nil
+    end
+    if bool(read(actor, "bIsPagerEnabled")) or bool(read(actor, "bIsPendingPagerEnabled")) then
+        log("Officer already has an active or pending pager; capture cancelled."); return nil
+    end
     original.valid, original.allowed, original.down = bool(original.valid), bool(original.allowed), bool(original.down)
+    original.snatched = bool(original.snatched)
     local shield_data = original.data
     if not valid(shield_data) then shield_data = read(actor, "SurrenderedHumanShieldData") end
     if not valid(shield_data) then return nil end
@@ -231,6 +247,10 @@ local function admit(actor, pawn, controller)
     }
     records[key] = record
     local ok = pcall(function()
+        -- Native pager arming reads this flag. Set it before the original
+        -- Server_StartInteraction body executes, not after the shove.
+        actor.bIsPagerSnatched = true
+        if not bool(read(actor, "bIsPagerSnatched")) then error("Radio suppression was not applied") end
         actor.HumanShieldData = shield_data -- Per-actor pointer; the shared asset is never edited.
         actor.bIsValidHumanShield = true
         actor:SetHumanShieldAllowed(true)
@@ -259,6 +279,7 @@ local function hook_post(context, interaction_param)
     if not record then return end
     hook_frames[key] = nil
     local ok, current = call(interactor, "GetCurrentInteraction")
+    if held_by(record.actor, record.pawn) then confirm_capture(record) end
     if not (ok and same(current, interaction)) and not held_by(record.actor, record.pawn) then
         finish(record, "The game rejected the grab; permissions restored.")
     end
@@ -277,6 +298,14 @@ local function push_action(record, path)
 end
 local function tick()
     install_hooks()
+    for key, entry in pairs(silenced) do
+        if not valid(entry.actor) or not same(world(entry.actor), entry.world) then
+            silenced[key] = nil
+        elseif not bool(read(entry.actor, "bIsPagerSnatched")) then
+            local ok, message = pcall(function() entry.actor.bIsPagerSnatched = true end)
+            if not ok then log("Captured officer's radio could not stay removed: " .. tostring(message)) end
+        end
+    end
     for key, request in pairs(requests) do
         if not valid(request.pawn) or not valid(request.actor)
             or not valid(request.interactor) or not valid(request.component)
@@ -291,6 +320,7 @@ local function tick()
         end
     end
     for _, record in pairs(records) do
+        if not record.captured and held_by(record.actor, record.pawn) then confirm_capture(record) end
         local alive = valid(record.actor) and valid(record.pawn)
             and bool(read(record.actor, "bIsAlive")) and bool(read(record.pawn, "bIsAlive"))
         if not valid(record.actor) then
@@ -305,6 +335,7 @@ local function tick()
             finish(record, "Native " .. record.phase .. " timed out; permissions restored.")
         elseif record.phase == "grabbing" then
             if held_by(record.actor, record.pawn) then
+                confirm_capture(record)
                 record.phase, record.deadline = "held", now(record.pawn) + HOLD_TIMEOUT
                 log("Officer grabbed. Press F6 while holding them to release and restrain.")
             end
@@ -397,8 +428,11 @@ local function diagnostics()
     local _, pawn = local_controller()
     local count = 0
     for _ in pairs(records) do count = count + 1 end
+    local silent_count = 0
+    for _ in pairs(silenced) do silent_count = silent_count + 1 end
     log("0.1.0; hook=" .. tostring(hooks_ready) .. "; player=" .. tostring(valid(pawn))
-        .. "; authority=" .. tostring(authority(pawn)) .. "; managed=" .. tostring(count))
+        .. "; authority=" .. tostring(authority(pawn)) .. "; managed=" .. tostring(count)
+        .. "; radios_removed=" .. tostring(silent_count))
     for _, record in pairs(records) do log((name(record.actor) or "officer") .. ": " .. record.phase) end
 end
 local function queue(callback, done)
