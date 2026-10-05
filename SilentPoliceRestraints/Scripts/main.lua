@@ -180,17 +180,33 @@ local function snapshot(actor, pawn, controller)
     return result
 end
 local function restore(record)
-    if not valid(record.actor) then return end
-    local ok, error_message = pcall(function()
-        record.actor.bIsValidHumanShield = record.original.valid
-        record.actor.HumanShieldData = record.original.data
-        record.actor:SetHumanShieldAllowed(record.original.allowed)
-        record.actor:SetDownOnGroundAllowed(record.original.down)
-    end)
-    if not ok then log("Permission restoration failed: " .. tostring(error_message)) end
+    if not valid(record.actor) then return true end
+    local restored = true
+    -- Attempt each independent restoration even when one native setter fails.
+    for _, setter in ipairs({
+        function() record.actor.bIsValidHumanShield = record.original.valid end,
+        function() record.actor.HumanShieldData = record.original.data end,
+        function() record.actor:SetHumanShieldAllowed(record.original.allowed) end,
+        function() record.actor:SetDownOnGroundAllowed(record.original.down) end,
+    }) do
+        local ok, error_message = pcall(setter)
+        if not ok then
+            restored = false
+            log("Permission restoration failed: " .. tostring(error_message))
+        end
+    end
+    return restored
 end
 local function finish(record, message)
-    restore(record)
+    if not restore(record) then
+        record.restore_attempts = (record.restore_attempts or 0) + 1
+        record.restore_message = message or record.restore_message
+        record.phase = record.restore_attempts < 3 and "restoring" or "restore failed"
+        if record.phase == "restore failed" then
+            log("Native restoration repeatedly failed. Restart the heist; F8 reports the affected officer.")
+        end
+        return
+    end
     records[record.key] = nil
     if message then log(message) end
 end
@@ -274,7 +290,13 @@ local function tick()
     for _, record in pairs(records) do
         local alive = valid(record.actor) and valid(record.pawn)
             and bool(read(record.actor, "bIsAlive")) and bool(read(record.pawn, "bIsAlive"))
-        if not alive or not same(world(record.pawn), record.world) or not same(world(record.actor), record.world) then
+        if not valid(record.actor) then
+            finish(record)
+        elseif record.phase == "restoring" then
+            finish(record, record.restore_message)
+        elseif record.phase == "restore failed" then
+            -- Retain the snapshot for diagnostics until the actor is destroyed.
+        elseif not alive or not same(world(record.pawn), record.world) or not same(world(record.actor), record.world) then
             finish(record)
         elseif now(record.pawn) >= record.deadline then
             finish(record, "Native " .. record.phase .. " timed out; permissions restored.")
